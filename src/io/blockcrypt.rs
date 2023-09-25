@@ -5,36 +5,153 @@ use embedded_io::{
     Io, SeekFrom,
 };
 use kms::KeyManagementScheme;
+use persistence::PersistentStorage;
 use std::marker::PhantomData;
+use std::cmp::min;
 
-pub struct BlockCryptIo<'a, IO, KMS, C, const BLK_SZ: usize, const KEY_SZ: usize> {
+pub struct BlockCryptIo<'a, IO, KMS, C, const BLK_SZ: usize, const KEY_SZ: usize, const PAD_SZ: usize> {
     io: IO,
     kms: &'a mut KMS,
     pd: PhantomData<C>,
+    pos: usize
 }
 
-impl<'a, IO, KMS, C, const BLK_SZ: usize, const KEY_SZ: usize>
-    BlockCryptIo<'a, IO, KMS, C, BLK_SZ, KEY_SZ>
+impl<'a, IO, KMS, C, const BLK_SZ: usize, const KEY_SZ: usize, const PAD_SZ: usize>
+    BlockCryptIo<'a, IO, KMS, C, BLK_SZ, KEY_SZ, PAD_SZ>
 {
     pub fn new(io: IO, kms: &'a mut KMS) -> Self {
         Self {
             io,
             kms,
             pd: PhantomData,
+            pos: 0
         }
     }
+
+    pub fn get_pad(&self) -> usize {
+        PAD_SZ
+    }
+
+    // Given the size of data being stored, give number of readable bytes
+    pub fn real_to_vir(&self, i: usize) -> usize {
+        if i == 0 {
+            return 0;
+        }
+
+        i - (PAD_SZ * ((i - 1) / BLK_SZ + 1) )
+    }
+
 }
 
-impl<IO, KMS, C, const BLK_SZ: usize, const KEY_SZ: usize> Io
-    for BlockCryptIo<'_, IO, KMS, C, BLK_SZ, KEY_SZ>
+impl<IO, KMS, C, const BLK_SZ: usize, const KEY_SZ: usize, const PAD_SZ: usize> Io
+    for BlockCryptIo<'_, IO, KMS, C, BLK_SZ, KEY_SZ, PAD_SZ>
 where
     IO: Io,
 {
     type Error = IO::Error;
 }
 
-impl<IO, KMS, C, const BLK_SZ: usize, const KEY_SZ: usize> Read
-    for BlockCryptIo<'_, IO, KMS, C, BLK_SZ, KEY_SZ>
+impl<'a, IO, KMS, C, const BLK_SZ: usize, const KEY_SZ: usize, const PAD_SZ: usize>
+    BlockCryptIo<'a, IO, KMS, C, BLK_SZ, KEY_SZ, PAD_SZ>
+where
+    IO: Read + Seek + Write,
+    KMS: KeyManagementScheme<KeyId = u64, Key = Key<KEY_SZ>>,
+    C: Crypter,
+{
+    // Given a larger size (in readable bytes stored) it will write more bytes
+    pub fn truncate(&mut self, size: usize) -> Result<usize, IO::Error> {
+        let mut max_size = self.io.seek(SeekFrom::End(0))? as usize;
+        println!("max size {}", max_size);
+        let mut total_bytes = self.real_to_vir(max_size);
+        
+        // If the truncate is the same as the file size return the same size
+        if total_bytes == size {
+            return Ok(max_size);
+        }
+
+        // This is ok because this function doesn't change the size of the file (unless expanding)
+        // Also a common case is clearing an entire file, but doing so needs doesn't need work
+        if size == 0 {
+            return Ok(0);
+        }
+
+        // Fill block with empty array
+        let read_buf = &mut [0u8; BLK_SZ];
+
+        let read_offset = min(size, total_bytes);
+
+        println!("ro {}", read_offset);
+        let vir_block = read_offset / (BLK_SZ - PAD_SZ);
+        let block_offset = vir_block * BLK_SZ;
+
+        // Find number of bytes needed to read
+        // If the number of blocks the file truncates to is strictly less than the current number of blocks
+        // Read the entire block, otherwise read the partial block
+        let block_size = match size / (BLK_SZ - PAD_SZ) < total_bytes / (BLK_SZ - PAD_SZ) {
+            true => BLK_SZ,
+            false => max_size % (BLK_SZ),
+        };
+        println!("bs {}", block_size);
+
+        // Read block
+        self.io.seek(SeekFrom::Start(block_offset as u64))?;
+        self.io.read_exact(&mut read_buf[0..block_size]);
+
+        // Encrypt block
+        let key = self.kms.derive(vir_block as u64).map_err(|_| ()).unwrap();
+        let mut tmp_buf = match C::onetime_decrypt(&key, &read_buf[0..block_size]).map_err(|_| ()) {
+            Ok(x) => x,
+            Err(_) => vec![],
+        };
+
+        // Find slice needed to write
+        // If the number of blocks the file trucates to is strictly greater than the current number of blocks
+        // We want to write back a full block, otherwise we want to write a partial block
+        let writeback_size = match total_bytes / (BLK_SZ - PAD_SZ) < size / (BLK_SZ - PAD_SZ) {
+            true => BLK_SZ - PAD_SZ,
+            false => size % (BLK_SZ - PAD_SZ),
+        };
+        tmp_buf.resize(writeback_size, 0);
+
+        // Write back block
+        self.kms.update(vir_block as u64).map_err(|_| ()).unwrap();
+        let key = self.kms.derive(vir_block as u64).map_err(|_| ()).unwrap();
+
+        tmp_buf = C::onetime_encrypt(&key, &tmp_buf).map_err(|_| ()).unwrap();
+        max_size = self.io.seek(SeekFrom::Start(block_offset as u64))? as usize;
+        self.io.write_all(&tmp_buf)?;
+        max_size += tmp_buf.len();
+        total_bytes = self.real_to_vir(max_size);
+        
+        // Write all the block aligned bytes, if the number of blocks is greater than the current file
+        while total_bytes < size {
+            let write_buf = [0u8; BLK_SZ];
+            
+            let byte_offset = total_bytes;
+            let vir_block = total_bytes / (BLK_SZ - PAD_SZ);
+
+            let bytes_write = match size - byte_offset > (BLK_SZ - PAD_SZ) {
+                true => BLK_SZ - PAD_SZ ,
+                false => size - byte_offset,
+            };
+
+            self.kms.update(vir_block as u64).map_err(|_| ()).unwrap();
+            let key = self.kms.derive(vir_block.try_into().unwrap()).map_err(|_| ()).unwrap();
+            let buf = C::onetime_encrypt(&key, &write_buf[0..bytes_write]).map_err(|_| ()).unwrap();
+
+            self.io.write_all(&buf);
+
+            total_bytes += bytes_write;
+
+            max_size = self.io.seek(SeekFrom::End(0))? as usize;
+        }
+
+        Ok(max_size) 
+    }
+}
+
+impl<IO, KMS, C, const BLK_SZ: usize, const KEY_SZ: usize, const PAD_SZ: usize> Read
+    for BlockCryptIo<'_, IO, KMS, C, BLK_SZ, KEY_SZ, PAD_SZ>
 where
     IO: Read + Seek,
     KMS: KeyManagementScheme<KeyId = u64, Key = Key<KEY_SZ>>,
@@ -44,71 +161,46 @@ where
         let mut total = 0;
         let mut size = buf.len();
 
-        let origin = self.io.stream_position()?;
-        let mut offset = origin as usize;
+        let max_size = self.io.seek(SeekFrom::End(0))? as usize;
 
-        // The offset may be within a block. This requires the bytes before the offset in the block
-        // and the bytes after the offset to be read.
-        if offset % BLK_SZ != 0 {
-            let block = offset / BLK_SZ;
-            let fill = offset % BLK_SZ;
-            let rest = size.min(BLK_SZ - fill);
+        let virtual_max_size = self.real_to_vir(max_size);
+        let mut index = self.stream_position()? as usize;
+        let read_buf = &mut [0u8; BLK_SZ];
 
-            let mut tmp_buf = vec![0; (fill + rest) as usize];
-            let off = block * BLK_SZ;
-
-            self.io.seek(SeekFrom::Start(off as u64))?;
-            let nbytes = self.io.read(&mut tmp_buf)?;
-            let actually_read = nbytes - fill;
-            if nbytes == 0 || actually_read == 0 {
-                self.io.seek(SeekFrom::Start(origin))?;
-                return Ok(0);
-            }
-
-            let key = self.kms.derive(block as u64).map_err(|_| ()).unwrap();
-            let tmp_buf = C::onetime_decrypt(&key, &tmp_buf).map_err(|_| ()).unwrap();
-
-            buf[..actually_read].copy_from_slice(&tmp_buf[fill..fill + actually_read]);
-
-            offset += actually_read;
-            total += actually_read;
-            size -= actually_read;
-        }
-
-        // At this point, the offset we want to read from is block-aligned. If it isn't, then we
-        // must have read all the bytes. Otherwise, read in the rest of the bytes block-by-block.
-        while size > 0 && offset % BLK_SZ == 0 {
-            let block = offset / BLK_SZ;
-            let rest = size.min(BLK_SZ);
-
-            let mut tmp_buf = vec![0; rest];
-            let off = block * BLK_SZ;
-
-            self.io.seek(SeekFrom::Start(off as u64))?;
-            let nbytes = self.io.read(&mut tmp_buf)?;
-            if nbytes == 0 {
-                self.io.seek(SeekFrom::Start(origin + total as u64))?;
+        while size > total {
+            if index >= virtual_max_size {
                 return Ok(total);
             }
 
-            let key = self.kms.derive(block as u64).map_err(|_| ()).unwrap();
-            let tmp_buf = C::onetime_decrypt(&key, &tmp_buf).map_err(|_| ()).unwrap();
+            let vir_block = index / (BLK_SZ - PAD_SZ);
+            let real_block = vir_block * BLK_SZ;
+            let to_read = match real_block + BLK_SZ < max_size {
+                true => BLK_SZ,
+                false => max_size - real_block
+            };
 
-            buf[total..total + nbytes].copy_from_slice(&tmp_buf[..nbytes]);
+            let buf_slice = &mut read_buf[0..to_read];
+            self.io.seek(SeekFrom::Start(real_block.try_into().unwrap()))?;
+            self.io.read_exact(buf_slice);
 
-            offset += nbytes;
-            size -= nbytes;
-            total += nbytes;
+            let key = self.kms.derive(vir_block as u64).map_err(|_| ()).unwrap();
+            let tmp_buf = C::onetime_decrypt(&key, buf_slice).map_err(|_| ()).unwrap();
+            
+            let left = index % (BLK_SZ - PAD_SZ);
+            let right = left + min(tmp_buf.len() - left, size - total);
+            buf[total.. total + right - left].copy_from_slice(&tmp_buf[left..right]);
+
+            let width: i64 = (right - left).try_into().unwrap();
+            index = self.seek(SeekFrom::Current(width))?.try_into().unwrap(); 
+            total += right - left;
         }
-
-        self.io.seek(SeekFrom::Start(origin + total as u64))?;
 
         Ok(total)
     }
 }
 
-impl<IO, KMS, C, const BLK_SZ: usize, const KEY_SZ: usize> Write
-    for BlockCryptIo<'_, IO, KMS, C, BLK_SZ, KEY_SZ>
+impl<IO, KMS, C, const BLK_SZ: usize, const KEY_SZ: usize, const PAD_SZ: usize> Write
+    for BlockCryptIo<'_, IO, KMS, C, BLK_SZ, KEY_SZ, PAD_SZ>
 where
     IO: Read + Write + Seek,
     KMS: KeyManagementScheme<KeyId = u64, Key = Key<KEY_SZ>>,
@@ -116,109 +208,65 @@ where
 {
     fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         let mut total = 0;
-        let mut size = buf.len();
+        let size = buf.len();
 
-        let origin = self.io.stream_position()?;
-        let mut offset = origin as usize;
+        let cursor = self.stream_position()? as usize;
+        let mut max_size: usize = self.io.seek(SeekFrom::End(0))?.try_into().unwrap();
+        let bytes_readable = self.real_to_vir(max_size);
 
-        // The write offset may or may not be block-aligned. If it isn't, then the bytes in the
-        // block preceding the offset byte should be read as well. The number of bytes to write
-        // starting from the offset should be the minimum of the total bytes left to write and the
-        // rest of the bytes in the block.
-        if offset % BLK_SZ != 0 {
-            let block = offset / BLK_SZ;
-            let fill = offset % BLK_SZ;
-            let rest = size.min(BLK_SZ - fill);
+        // If the cursor is past the size of the file, extend the file to ensure it's writable
+        max_size = match cursor < bytes_readable {
+            true => max_size,
+            false => self.truncate(cursor)?,
+        };
+        
+        let mut index = self.stream_position()? as usize;
 
-            let mut tmp_buf = vec![0; BLK_SZ];
-            let off = block * BLK_SZ;
+        let read_buf = &mut [0u8; BLK_SZ];
+        
+        while total < size {
+            let vir_block = index / (BLK_SZ - PAD_SZ);
+            let real_block = vir_block * BLK_SZ;
+            let mut tmp_buf = {
+                if max_size <= real_block {
+                    vec![]
+                }
+                else {
+                    let to_read = min(max_size - real_block, BLK_SZ);
+                    let buf_slice = &mut read_buf[0..to_read];
+    
+                    self.io.seek(SeekFrom::Start(real_block.try_into().unwrap()))?;
+                    self.io.read_exact(buf_slice).unwrap();
+                    let key = self.kms.derive(vir_block as u64).map_err(|_| ()).unwrap();
+                    let tmp_buf = C::onetime_decrypt(&key, buf_slice).map_err(|_| ()).unwrap();
 
-            self.io.seek(SeekFrom::Start(off as u64))?;
-            let nbytes = self.io.read(&mut tmp_buf)?;
-            if nbytes == 0 {
-                self.io.seek(SeekFrom::Start(origin))?;
-                return Ok(0);
+                    tmp_buf
+                }
+            };
+
+
+            let left = index % (BLK_SZ - PAD_SZ);
+            let right = left + min(size - total, BLK_SZ - PAD_SZ - left);
+
+            if right > tmp_buf.len() {
+                tmp_buf.resize(right, 0);
             }
 
-            let key = self.kms.derive(block as u64).map_err(|_| ()).unwrap();
-            let mut tmp_buf = C::onetime_decrypt(&key, &tmp_buf).map_err(|_| ()).unwrap();
-
-            tmp_buf[fill..fill + rest].copy_from_slice(&buf[..rest]);
-
-            self.kms.update(block as u64).map_err(|_| ()).unwrap();
-            let key = self.kms.derive(block as u64).map_err(|_| ()).unwrap();
-            let tmp_buf = C::onetime_encrypt(&key, &tmp_buf).map_err(|_| ()).unwrap();
-
-            let amount = nbytes.max(fill + rest);
-            self.io.seek(SeekFrom::Start(off as u64))?;
-            let nbytes = self.io.write(&tmp_buf[..amount])?;
-            let actually_written = rest.min(nbytes - fill);
-            if nbytes == 0 || actually_written == 0 {
-                self.io.seek(SeekFrom::Start(origin))?;
-                return Ok(0);
+            for i in left..right {
+                tmp_buf[i] = buf[i - left];
             }
+            
+            self.kms.update(vir_block as u64).map_err(|_| ()).unwrap();
+            let key = self.kms.derive(vir_block as u64).map_err(|_| ()).unwrap();
 
-            offset += actually_written;
-            size -= actually_written;
-            total += actually_written;
+            tmp_buf = C::onetime_encrypt(&key, &tmp_buf).map_err(|_| ()).unwrap();
+            self.io.seek(SeekFrom::Start(real_block.try_into().unwrap()))?;
+            self.io.write_all(&tmp_buf)?;
+
+            total += right - left;
+            
+            index = self.seek(SeekFrom::Current((right - left).try_into().unwrap()))?.try_into().unwrap();
         }
-
-        // The offset we want to write to should be block-aligned at this point. If not, then we
-        // must have written out all the bytes already. Otherwise, write the rest of the bytes
-        // block-by-block.
-        while size > 0 && size / BLK_SZ > 0 && offset % BLK_SZ == 0 {
-            let block = offset / BLK_SZ;
-            self.kms.update(block as u64).map_err(|_| ()).unwrap();
-            let key = self.kms.derive(block as u64).map_err(|_| ()).unwrap();
-            let tmp_buf = C::onetime_encrypt(&key, &buf[total..total + BLK_SZ])
-                .map_err(|_| ())
-                .unwrap();
-
-            let off = block * BLK_SZ;
-            self.io.seek(SeekFrom::Start(off as u64))?;
-            let nbytes = self.io.write(&tmp_buf)?;
-            if nbytes == 0 {
-                self.io.seek(SeekFrom::Start(origin + total as u64))?;
-                return Ok(total);
-            }
-
-            offset += nbytes;
-            size -= nbytes;
-            total += nbytes;
-        }
-
-        // Write any remaining bytes that don't fill an entire block. We handle this specially
-        // since we have to read in the block to decrypt the bytes after the overwritten bytes.
-        if size > 0 {
-            let block = offset / BLK_SZ;
-
-            // Try to read a whole block.
-            let mut tmp_buf = vec![0; BLK_SZ];
-            let off = block * BLK_SZ;
-            self.io.seek(SeekFrom::Start(off as u64))?;
-            let actually_read = self.io.read(&mut tmp_buf)?;
-            let actually_write = size.max(actually_read);
-
-            let key = self.kms.derive(block as u64).map_err(|_| ()).unwrap();
-            let mut tmp_buf = C::onetime_decrypt(&key, &tmp_buf).map_err(|_| ()).unwrap();
-
-            tmp_buf[..size].copy_from_slice(&buf[total..total + size]);
-
-            self.kms.update(block as u64).map_err(|_| ()).unwrap();
-            let key = self.kms.derive(block as u64).map_err(|_| ()).unwrap();
-            let tmp_buf = C::onetime_encrypt(&key, &tmp_buf).map_err(|_| ()).unwrap();
-
-            self.io.seek(SeekFrom::Start(off as u64))?;
-            let nbytes = self.io.write(&tmp_buf[..actually_write])?;
-            total += size.min(nbytes as usize);
-
-            if nbytes == 0 {
-                self.io.seek(SeekFrom::Start(origin + total as u64))?;
-                return Ok(total);
-            }
-        }
-
-        self.io.seek(SeekFrom::Start(origin + total as u64))?;
 
         Ok(total)
     }
@@ -228,13 +276,33 @@ where
     }
 }
 
-impl<IO, KMS, C, const BLK_SZ: usize, const KEY_SZ: usize> Seek
-    for BlockCryptIo<'_, IO, KMS, C, BLK_SZ, KEY_SZ>
+impl<IO, KMS, C, const BLK_SZ: usize, const KEY_SZ: usize, const PAD_SZ: usize> Seek
+    for BlockCryptIo<'_, IO, KMS, C, BLK_SZ, KEY_SZ, PAD_SZ>
 where
     IO: Seek,
 {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64, Self::Error> {
-        self.io.seek(pos)
+        self.pos = match pos {
+            SeekFrom::Start(x) => x.try_into().unwrap(),
+            SeekFrom::End(x) => {
+                let end = self.io.seek(SeekFrom::End(0))? as usize;
+
+                self.real_to_vir(end) + x as usize
+            },
+            SeekFrom::Current(x) => self.pos + x as usize,
+        };
+
+        Ok(self.pos.try_into().unwrap())
+    }
+
+    fn rewind(&mut self) -> Result<(), Self::Error> {
+        self.pos = 0;
+
+        Ok(())
+    }
+
+    fn stream_position(&mut self) -> Result<u64, Self::Error> {
+        Ok(self.pos.try_into().unwrap())
     }
 }
 

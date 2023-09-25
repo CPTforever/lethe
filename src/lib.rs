@@ -226,7 +226,7 @@ where
     type Flags = <P as PersistentStorage>::Flags;
     type Info = <P as PersistentStorage>::Info;
     type Error = Error;
-    type Io<'a> = BlockCryptIo<'a, P::Io<'a>, Khf<R, H, E>, C, D, E>
+    type Io<'a> = BlockCryptIo<'a, P::Io<'a>, Khf<R, H, E>, C, D, E, 40>
         where
             S: 'a,
             P: 'a,
@@ -269,6 +269,8 @@ where
 
             self.storage.destroy(&entry.khf_id).map_err(|_| Error::Io)?;
             self.storage.destroy(&entry.map_id).map_err(|_| Error::Io)?;
+
+            self.master_khf.commit();
         }
         Ok(())
     }
@@ -318,37 +320,39 @@ where
     }
 
     fn truncate(&mut self, objid: &Self::Id, size: u64) -> Result<(), Self::Error> {
-        // Number of bytes past a block.
-        let extra = size % D as u64;
+        let map_id = {
+            let entry: &MapEntry = self.mappings.get(objid).ok_or(Error::MissingKhf)?;
+            entry.map_id
+        };
 
-        // Need to rewrite the extra bytes.
-        if extra > 0 {
-            let mut io = self.rw_handle(objid)?;
-            let mut buf = vec![0; extra as usize];
-            let offset = (size / D as u64) * D as u64;
+        // Cut off the tail from 
+        let real_size = {
+            let mut x = self.rw_handle(objid).unwrap();
 
-            // Read in the extra bytes.
-            io.seek(SeekFrom::Start(offset)).map_err(|_| Error::Io)?;
-            io.read(&mut buf).map_err(|_| Error::Io)?;
+            x.truncate(size.try_into().unwrap()).unwrap()
+        };
 
-            // Write the extra bytes.
-            io.seek(SeekFrom::Start(offset)).map_err(|_| Error::Io)?;
-            io.write(&buf).map_err(|_| Error::Io)?;
-        }
+        println!("real size when truncated {}", real_size);
+        // Truncate the storage medium that 'removes' the bytes from the file
+        self.storage.truncate(&map_id, real_size.try_into().unwrap()).unwrap();
 
         // Truncate the forest. Not needed for security, but nice for efficiency.
-        let keys = (size + (D as u64 - 1)) / D as u64;
-        self.get_khf_mut(*objid)?
-            .ok_or(Error::MissingKhf)?
-            .truncate(keys);
+        {
+            let keys = (size + ((D - 40) as u64 - 1)) / (D - 40) as u64;
+            self.get_khf_mut(*objid)?
+                .ok_or(Error::MissingKhf)?
+                .truncate(keys);
+        }
+    
 
-        // Truncate the object itself.
-        self.storage.truncate(objid, size).map_err(|_| Error::Io)
+
+        Ok(())
     }
 
     fn persist_state(&mut self) -> Result<(), Self::Error> {
         // Persist the updated object `Khf`s.
         for khf_id in self.master_khf.commit() {
+            println!("khf_id {}", khf_id);
             let khf = self.object_khfs.get_mut(&khf_id).unwrap();
             khf.commit();
 
@@ -374,6 +378,7 @@ where
                 self.master_key,
             );
             let ser = bincode::serialize(&self.master_khf)?;
+
             io.write_all(&ser).map_err(|_| Error::Io)?;
         }
 

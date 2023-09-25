@@ -45,6 +45,16 @@ where
 
         Ok(n)
     }
+
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize, Self::Error> {
+        self.io.read_to_end(buf)?;
+
+        let x = C::onetime_decrypt(&self.key, &buf)
+            .map_err(|_| ())
+            .unwrap();
+        buf.clone_from(&x);
+        Ok(buf.len())
+    }
 }
 
 impl<IO, C, const KEY_SZ: usize> Write for CryptIo<IO, C, KEY_SZ>
@@ -59,6 +69,15 @@ where
 
     fn flush(&mut self) -> Result<(), Self::Error> {
         self.io.flush()
+    }
+
+    /// Write an entire buffer into this writer.
+    fn write_all(&mut self, mut buf: &[u8]) -> Result<(), Self::Error> {
+        let encrypted = C::onetime_encrypt(&self.key, buf).map_err(|_| ()).unwrap();
+
+        self.io.write_all(&encrypted)?;
+
+        Ok(())
     }
 }
 
