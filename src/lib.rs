@@ -332,7 +332,6 @@ where
             x.truncate(size.try_into().unwrap()).unwrap()
         };
 
-        println!("real size when truncated {}", real_size);
         // Truncate the storage medium that 'removes' the bytes from the file
         self.storage.truncate(&map_id, real_size.try_into().unwrap()).unwrap();
 
@@ -352,7 +351,6 @@ where
     fn persist_state(&mut self) -> Result<(), Self::Error> {
         // Persist the updated object `Khf`s.
         for khf_id in self.master_khf.commit() {
-            println!("khf_id {}", khf_id);
             let khf = self.object_khfs.get_mut(&khf_id).unwrap();
             khf.commit();
 
